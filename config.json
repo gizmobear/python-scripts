@@ -1,0 +1,12 @@
+{
+  "apps": {
+    "librewolf": {
+      "cmd": ["librewolf.exe"],
+      "max_days_idle": 3,
+      "cleanup_paths": [
+        "C:\\Users\\Aaron.Gruber\\AppData\\librewolf",
+        "C:\\Users\\Aaron.Gruber\\Roaming\\librewolf"
+      ]
+    }
+  }
+}
