@@ -1,12 +1,13 @@
 {
   "apps": {
-    "librewolf": {
-      "cmd": ["librewolf.exe"],
+    "firefox": {
+      "cmd": ["C:\\Program Files\\Mozilla Firefox\\firefox.exe"],
       "max_days_idle": 3,
       "cleanup_paths": [
-        "C:\\Users\\Aaron.Gruber\\AppData\\librewolf",
-        "C:\\Users\\Aaron.Gruber\\Roaming\\librewolf"
+        "C:\\Users\\Aaron.Gruber\\AppData\\Roaming\\Mozilla",
+        "C:\\Users\\Aaron.Gruber\\AppData\\Local\\Mozilla"
       ]
     }
+
   }
 }

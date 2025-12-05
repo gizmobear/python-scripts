@@ -9,304 +9,229 @@ Usage:
   Note: <app_name> must match a key under "apps" in config.json.
 
 Configuration:
-  - Define apps in config.json (same directory). See config.json for structure and examples.
-  - Each app needs: cmd (list), max_days_idle (int), cleanup_paths (list of paths).
+  - Define apps in config.json (same directory).
+  - Each app needs: cmd (list/string), max_days_idle (int), cleanup_paths (list of paths).
 
 Author: Aaron Gruber
 Change Log:
-  - 2025-12-05: Added external config.json support, state file locking, and improved symlink deletion.
-  - 2025-12-05: Added task-all to process every configured app in one run.
+  - 2025-12-05: Refactored to use pathlib, logging, and sqlite3 for state management.
 """
 
 import argparse
-import contextlib
 import datetime as dt
 import json
+import logging
 import os
-import stat
+import secrets
+import shlex
+import shutil
+import sqlite3
 import subprocess
 import sys
-import time
-from typing import Dict, Any, List, Optional
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Union
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-_CONFIG_CACHE: Optional[Dict[str, Any]] = None
+# ---------------------------------------------------------------------------
+# GLOBAL SETUP
+# ---------------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "config.json"
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger("AppLauncher")
+
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 
-# Configuration now lives in config.json (same directory as this script).
-# See config.json for example structure:
-# {
-#   "apps": {
-#     "example_app": {
-#       "cmd": ["C:\\\\Path\\\\To\\\\App.exe"],
-#       "max_days_idle": 30,
-#       "cleanup_paths": ["C:\\\\Path\\\\To\\\\App\\\\cache"]
-#     }
-#   }
-# }
-#
-# WARNING: On SSDs, *no* software-only method can guarantee true secure deletion
-# due to wear-leveling. This does best-effort overwrites + delete.
-
-
 def load_config() -> Dict[str, Any]:
-    """Load config.json once and reuse; exit with a helpful message on errors."""
-    global _CONFIG_CACHE
-    if _CONFIG_CACHE is not None:
-        return _CONFIG_CACHE
+    """Load config.json once."""
+    if not CONFIG_PATH.exists():
+        logger.error(f"Missing config file at {CONFIG_PATH}.")
+        logger.error("Create config.json (see example in this repo).")
+        sys.exit(1)
 
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        print(f"[ERROR] Missing config file at {CONFIG_PATH}.", file=sys.stderr)
-        print("        Create config.json (see example in this repo).", file=sys.stderr)
-        sys.exit(1)
+        text = CONFIG_PATH.read_text(encoding="utf-8")
+        data = json.loads(text)
     except json.JSONDecodeError as e:
-        print(f"[ERROR] Failed to parse config.json: {e}", file=sys.stderr)
+        logger.error(f"Failed to parse config.json: {e}")
         sys.exit(1)
 
-    if not isinstance(data, dict):
-        print("[ERROR] config.json must contain a JSON object.", file=sys.stderr)
+    if not isinstance(data, dict) or "apps" not in data:
+        logger.error("config.json must contain a JSON object with an 'apps' key.")
         sys.exit(1)
 
-    apps = data.get("apps")
-    if not isinstance(apps, dict):
-        print("[ERROR] config.json must define an 'apps' object mapping names to configs.", file=sys.stderr)
-        sys.exit(1)
-
-    _CONFIG_CACHE = data
     return data
 
 
 # ---------------------------------------------------------------------------
-# STATE STORAGE
+# STATE STORAGE (SQLite3)
 # ---------------------------------------------------------------------------
 
-def get_state_file() -> str:
-    """Return path to JSON file storing last launch times."""
+def get_db_path() -> Path:
+    """Return path to SQLite database."""
     if os.name == "nt":
-        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        base = Path(os.environ.get("APPDATA", Path.home()))
     else:
-        base = os.path.expanduser("~")
-
-    state_dir = os.path.join(base, ".app_launch_tracker")
-    os.makedirs(state_dir, exist_ok=True)
-    return os.path.join(state_dir, "state.json")
-
-
-def _read_state(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        # Corrupt file? Start fresh.
-        return {}
+        base = Path.home()
+    
+    state_dir = base / ".app_launch_tracker"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir / "state.db"
 
 
-def _write_state(path: str, state: Dict[str, Any]) -> None:
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp_path, path)
-
-
-def _state_lock_path() -> str:
-    return get_state_file() + ".lock"
-
-
-@contextlib.contextmanager
-def _state_lock(timeout: float = 5.0, retry_delay: float = 0.1):
-    """Cross-platform file lock to avoid concurrent state writes."""
-    lock_path = _state_lock_path()
-    if os.name == "nt":
-        import msvcrt
-
-        lock_file = open(lock_path, "a+b")
-        start = time.time()
-        try:
-            while True:
-                try:
-                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    if time.time() - start >= timeout:
-                        raise TimeoutError("Timed out waiting for state lock")
-                    time.sleep(retry_delay)
-            yield
-        finally:
-            try:
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-            except OSError:
-                pass
-            lock_file.close()
-    else:
-        import fcntl
-
-        lock_file = open(lock_path, "a+b")
-        try:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
-            yield
-        finally:
-            try:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            lock_file.close()
-
-
-def load_state() -> Dict[str, Any]:
-    path = get_state_file()
-    try:
-        with _state_lock():
-            return _read_state(path)
-    except TimeoutError as e:
-        print(f"[WARN] Could not acquire state lock for read: {e}", file=sys.stderr)
-        return {}
-
-
-def save_state(state: Dict[str, Any]) -> None:
-    path = get_state_file()
-    try:
-        with _state_lock():
-            _write_state(path, state)
-    except TimeoutError as e:
-        print(f"[WARN] Could not acquire state lock for write: {e}", file=sys.stderr)
+def init_db(db_path: Path) -> None:
+    """Initialize the database schema if needed."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS launches (
+                app_name TEXT PRIMARY KEY,
+                last_launch_iso TEXT NOT NULL
+            )
+        """)
+        conn.commit()
 
 
 def record_launch(app_name: str) -> None:
-    state_path = get_state_file()
+    """Update the last launch time for the app."""
+    db_path = get_db_path()
+    init_db(db_path)
+    
     now = dt.datetime.now(dt.timezone.utc).isoformat()
     try:
-        with _state_lock():
-            state = _read_state(state_path)
-            state.setdefault("apps", {})
-            state["apps"][app_name] = {"last_launch": now}
-            _write_state(state_path, state)
-    except TimeoutError as e:
-        print(f"[WARN] Could not record launch due to lock timeout: {e}", file=sys.stderr)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("""
+                INSERT INTO launches (app_name, last_launch_iso)
+                VALUES (?, ?)
+                ON CONFLICT(app_name) DO UPDATE SET last_launch_iso = excluded.last_launch_iso
+            """, (app_name, now))
+            conn.commit()
+    except sqlite3.Error as e:
+        logger.warning(f"Failed to record launch in DB: {e}")
 
 
-def get_last_launch(app_name: str):
-    state = load_state()
-    app_info = state.get("apps", {}).get(app_name)
-    if not app_info:
-        return None
+def get_last_launch(app_name: str) -> Optional[dt.datetime]:
+    """Get the last launch time for the app."""
+    db_path = get_db_path()
+    init_db(db_path)
+    
     try:
-        return dt.datetime.fromisoformat(app_info["last_launch"])
-    except Exception:
-        return None
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute("SELECT last_launch_iso FROM launches WHERE app_name = ?", (app_name,))
+            row = cursor.fetchone()
+            if row:
+                return dt.datetime.fromisoformat(row[0])
+    except (sqlite3.Error, ValueError) as e:
+        logger.warning(f"Failed to read launch time: {e}")
+    return None
 
 
 # ---------------------------------------------------------------------------
 # SECURE DELETE
 # ---------------------------------------------------------------------------
 
-def _make_writable(path: str) -> None:
-    """Ensure file/dir is writable so we can overwrite/delete."""
+def _make_writable(path: Path) -> None:
+    """Ensure file/dir is writable."""
     try:
-        mode = os.stat(path).st_mode
-        os.chmod(path, mode | stat.S_IWUSR)
+        # 0o700: user rwx
+        if path.exists():
+            path.chmod(0o777) 
     except Exception:
         pass
 
-
-def secure_delete_file(path: str, passes: int = 3) -> None:
+def secure_delete_file(path: Path, passes: int = 3) -> None:
     """Best-effort secure delete for a single file."""
     try:
-        if not os.path.isfile(path):
+        if not path.is_file():
             return
 
         _make_writable(path)
-        length = os.path.getsize(path)
+        length = path.stat().st_size
 
-        with open(path, "r+b", buffering=0) as f:
+        with path.open("r+b", buffering=0) as f:
             for _ in range(passes):
                 f.seek(0)
-                # overwrite with random bytes
+                # Overwrite with random bytes
                 remaining = length
                 chunk_size = 1024 * 1024
                 while remaining > 0:
                     to_write = min(chunk_size, remaining)
-                    f.write(os.urandom(to_write))
+                    f.write(secrets.token_bytes(to_write))
                     remaining -= to_write
                 f.flush()
+                # Force write to disk
                 os.fsync(f.fileno())
-        # Finally delete the file
-        os.remove(path)
+        
+        path.unlink()
     except Exception as e:
-        print(f"[WARN] Failed secure delete of file {path}: {e}", file=sys.stderr)
+        logger.warning(f"Failed secure delete of file {path}: {e}")
 
 
-def secure_delete_path(path: str, passes: int = 3) -> None:
+def secure_delete_path(path: Union[str, Path], passes: int = 3) -> None:
     """Recursively secure delete a file or directory."""
-    if not os.path.lexists(path):
+    target = Path(path)
+    if not target.exists() and not target.is_symlink():
         return
 
-    if os.path.islink(path):
+    # Handle symlinks (delete link, not target)
+    if target.is_symlink():
         try:
-            os.remove(path)
+            target.unlink()
         except Exception as e:
-            print(f"[WARN] Failed to remove symlink {path}: {e}", file=sys.stderr)
+            logger.warning(f"Failed to remove symlink {target}: {e}")
         return
 
-    if os.path.isfile(path):
-        secure_delete_file(path, passes=passes)
+    if target.is_file():
+        secure_delete_file(target, passes=passes)
         return
 
-    # Directory: walk bottom-up
-    for root, dirs, files in os.walk(path, topdown=False):
+    # Directory: recursive delete
+    # We walk using rglob('*') but that won't give us the order strictly bottom-up for dirs easily
+    # So we use os.walk (or manual) to ensure we delete children before parents.
+    # Actually, shutil.rmtree has no secure overwrite.
+    # We'll stick to os.walk logic but with path objects for cleaner code.
+    
+    for root, dirs, files in os.walk(target, topdown=False):
+        root_path = Path(root)
         for name in files:
-            file_path = os.path.join(root, name)
-            if os.path.islink(file_path):
-                try:
-                    os.remove(file_path)
-                except Exception as e:
-                    print(f"[WARN] Failed to remove symlink {file_path}: {e}", file=sys.stderr)
-                continue
-            secure_delete_file(file_path, passes=passes)
+            fpath = root_path / name
+            if fpath.is_symlink():
+                fpath.unlink(missing_ok=True)
+            else:
+                secure_delete_file(fpath, passes=passes)
+        
         for name in dirs:
-            dir_path = os.path.join(root, name)
-            if os.path.islink(dir_path):
+            dpath = root_path / name
+            if dpath.is_symlink():
+                dpath.unlink(missing_ok=True)
+            else:
+                _make_writable(dpath)
                 try:
-                    os.remove(dir_path)
-                except Exception as e:
-                    print(f"[WARN] Failed to remove symlink {dir_path}: {e}", file=sys.stderr)
-                continue
-            try:
-                _make_writable(dir_path)
-                os.rmdir(dir_path)
-            except Exception:
-                pass
-    # Remove the top-level directory if empty
+                    dpath.rmdir()
+                except OSError as e:
+                    logger.warning(f"Failed to remove dir {dpath}: {e}")
+
+    # Finally remove top directory
+    _make_writable(target)
     try:
-        _make_writable(path)
-        os.rmdir(path)
-    except Exception as e:
-        print(f"[WARN] Failed to remove directory {path}: {e}", file=sys.stderr)
+        target.rmdir()
+    except OSError as e:
+        logger.warning(f"Failed to remove directory {target}: {e}")
 
 
 def secure_delete_paths(paths: List[str], passes: int = 3) -> None:
     for p in paths:
-        print(f"[INFO] Securely deleting: {p}")
-        secure_delete_path(p, passes=passes)
-
-def handle_task_all() -> None:
-    """Run task for every configured app."""
-    config = load_config()
-    apps = config.get("apps", {})
-    if not apps:
-        print("[INFO] No apps configured in config.json.")
-        return
-    for app_name in apps:
-        print(f"[INFO] Running task for '{app_name}'")
-        handle_task(app_name)
+        path_obj = Path(p)
+        logger.info(f"Securely deleting: {path_obj}")
+        secure_delete_path(path_obj, passes=passes)
 
 
 # ---------------------------------------------------------------------------
@@ -317,36 +242,59 @@ def get_app_config(app_name: str) -> Dict[str, Any]:
     config = load_config()
     app = config.get("apps", {}).get(app_name)
     if not app:
-        print(f"[ERROR] Unknown app '{app_name}'. Configure it in config.json.", file=sys.stderr)
+        logger.error(f"Unknown app '{app_name}'. Configure it in config.json.")
         sys.exit(1)
     return app
 
 
+def _normalize_cmd(cmd_value: Any) -> List[str]:
+    """Ensure cmd is a list of strings."""
+    if isinstance(cmd_value, list) and all(isinstance(part, str) for part in cmd_value):
+        return cmd_value
+    if isinstance(cmd_value, str):
+        # posix=True usually handles quotes better, even on Windows for many cases,
+        # but standard practice for Windows shell is posix=False.
+        split_cmd = shlex.split(cmd_value, posix=(os.name != "nt"))
+        if split_cmd:
+            return split_cmd
+    logger.error("'cmd' must be a non-empty list of strings or a string command line.")
+    sys.exit(1)
+
+
 def handle_launch(app_name: str) -> None:
     app = get_app_config(app_name)
-    cmd = app.get("cmd")
-    if not cmd:
-        print(f"[ERROR] No 'cmd' configured for app '{app_name}'.", file=sys.stderr)
+    raw_cmd = app.get("cmd")
+    if not raw_cmd:
+        logger.error(f"No 'cmd' configured for app '{app_name}'.")
         sys.exit(1)
 
-    print(f"[INFO] Launching '{app_name}': {cmd}")
+    cmd = _normalize_cmd(raw_cmd)
+    
+    # Resolve first argument (executable)
+    exe = cmd[0]
+    resolved_exe = shutil.which(exe) or (exe if Path(exe).exists() else None)
+    
+    if not resolved_exe:
+        logger.error(f"Executable not found for '{app_name}': {exe}")
+        logger.error("Check the path in config.json or ensure it is on PATH.")
+        sys.exit(1)
+    
+    cmd[0] = resolved_exe
+
+    logger.info(f"Launching '{app_name}': {cmd}")
     try:
-        # Start process detached from this script
+        # Detach process
         if os.name == "nt":
-            # CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS (0x00000002 | 0x00000008)
-            creationflags = 0x00000002 | 0x00000008
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
             subprocess.Popen(cmd, creationflags=creationflags)
         else:
             subprocess.Popen(cmd, start_new_session=True)
-    except FileNotFoundError:
-        print(f"[ERROR] Executable not found for '{app_name}'. Check 'cmd' path.", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"[ERROR] Failed to launch '{app_name}': {e}", file=sys.stderr)
+    except OSError as e:
+        logger.error(f"Failed to launch '{app_name}': {e}")
         sys.exit(1)
 
     record_launch(app_name)
-    print(f"[INFO] Recorded launch time for '{app_name}'.")
+    logger.info(f"Recorded launch time for '{app_name}'.")
 
 
 def handle_task(app_name: str) -> None:
@@ -355,39 +303,58 @@ def handle_task(app_name: str) -> None:
     cleanup_paths = app.get("cleanup_paths", [])
 
     if max_days is None:
-        print(f"[WARN] No 'max_days_idle' configured for '{app_name}'. Nothing to do.")
+        logger.warning(f"No 'max_days_idle' configured for '{app_name}'. Nothing to do.")
         return
 
     last_launch = get_last_launch(app_name)
     now = dt.datetime.now(dt.timezone.utc)
 
     if last_launch is None:
-        print(f"[INFO] App '{app_name}' has never been launched (no record).")
+        logger.info(f"App '{app_name}' has never been launched (no record).")
+        # Optimization: If never launched, do we delete? 
+        # Requirement was "if idle too long". Never launched = infinite idle?
+        # Usually implies we shouldn't delete if we never used it, OR we should?
+        # Let's assume safely: if record missing, treat as "unknown/infinite" but
+        # usually we might want to check file timestamps.
+        # For this script's contract: launch app -> record time.
+        # If no record, we can't judge "idle from last usage".
+        # Let's assume we skip unless we have data, to be safe.
         idle_days = None
     else:
         if last_launch.tzinfo is None:
-            # assume UTC if naive
             last_launch = last_launch.replace(tzinfo=dt.timezone.utc)
+        
         delta = now - last_launch
         idle_days = delta.days
-        print(f"[INFO] App '{app_name}' last launch: {last_launch.isoformat()} "
-              f"({idle_days} days ago)")
+        logger.info(f"App '{app_name}' last launch: {last_launch.isoformat()} ({idle_days} days ago)")
 
-    if idle_days is None or idle_days > max_days:
+    if idle_days is not None and idle_days > max_days:
         if not cleanup_paths:
-            print(f"[INFO] No cleanup paths configured for '{app_name}'. Skipping deletion.")
+            logger.info(f"No cleanup paths configured for '{app_name}'. Skipping deletion.")
             return
-        print(f"[INFO] Idle threshold exceeded (>{max_days} days). Proceeding to secure delete.")
+        logger.info(f"Idle threshold exceeded (>{max_days} days). Proceeding to secure delete.")
         secure_delete_paths(cleanup_paths, passes=3)
     else:
-        print(f"[INFO] App '{app_name}' not idle long enough (<= {max_days} days). No action.")
+        logger.info(f"App '{app_name}' status: OK (Idle: {idle_days} vs Max: {max_days})")
+
+
+def handle_task_all() -> None:
+    """Run task for every configured app."""
+    config = load_config()
+    apps = config.get("apps", {})
+    if not apps:
+        logger.info("No apps configured in config.json.")
+        return
+    for app_name in apps:
+        logger.info(f"Running task for '{app_name}'")
+        handle_task(app_name)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_args():
+def main():
     parser = argparse.ArgumentParser(
         description="Launch apps and clean up their data if not used for N days."
     )
@@ -396,22 +363,12 @@ def parse_args():
     p_launch = subparsers.add_parser("launch", help="Launch an application and record launch time.")
     p_launch.add_argument("app_name", help="Name of the app as defined in config.json.")
 
-    p_task = subparsers.add_parser(
-        "task",
-        help="Check last launch; if idle too long, securely delete configured paths.",
-    )
+    p_task = subparsers.add_parser("task", help="Check idle time and cleanup if needed.")
     p_task.add_argument("app_name", help="Name of the app as defined in config.json.")
 
-    subparsers.add_parser(
-        "task-all",
-        help="Run task for every app defined in config.json.",
-    )
+    subparsers.add_parser("task-all", help="Check all apps.")
 
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
+    args = parser.parse_args()
 
     if args.command == "launch":
         handle_launch(args.app_name)
@@ -419,11 +376,6 @@ def main():
         handle_task(args.app_name)
     elif args.command == "task-all":
         handle_task_all()
-    else:
-        # Should never hit this with argparse's required=True
-        print("[ERROR] Unknown command.", file=sys.stderr)
-        sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
