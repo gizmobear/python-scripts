@@ -5,7 +5,8 @@ App Launcher & Cleanup
 Usage:
   python app_launcher.py launch <app_name>   # launch app and record time
   python app_launcher.py task <app_name>     # if idle too long, securely delete cleanup_paths
-  Note: <app_name> must match defined app name in config.json.
+  python app_launcher.py task-all            # run task for every app in config.json
+  Note: <app_name> must match a key under "apps" in config.json.
 
 Configuration:
   - Define apps in config.json (same directory). See config.json for structure and examples.
@@ -14,6 +15,7 @@ Configuration:
 Author: Aaron Gruber
 Change Log:
   - 2025-12-05: Added external config.json support, state file locking, and improved symlink deletion.
+  - 2025-12-05: Added task-all to process every configured app in one run.
 """
 
 import argparse
@@ -295,6 +297,17 @@ def secure_delete_paths(paths: List[str], passes: int = 3) -> None:
         print(f"[INFO] Securely deleting: {p}")
         secure_delete_path(p, passes=passes)
 
+def handle_task_all() -> None:
+    """Run task for every configured app."""
+    config = load_config()
+    apps = config.get("apps", {})
+    if not apps:
+        print("[INFO] No apps configured in config.json.")
+        return
+    for app_name in apps:
+        print(f"[INFO] Running task for '{app_name}'")
+        handle_task(app_name)
+
 
 # ---------------------------------------------------------------------------
 # APP ACTIONS
@@ -381,13 +394,18 @@ def parse_args():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     p_launch = subparsers.add_parser("launch", help="Launch an application and record launch time.")
-    p_launch.add_argument("app_name", help="Name of the app as defined in APPS.")
+    p_launch.add_argument("app_name", help="Name of the app as defined in config.json.")
 
     p_task = subparsers.add_parser(
         "task",
         help="Check last launch; if idle too long, securely delete configured paths.",
     )
-    p_task.add_argument("app_name", help="Name of the app as defined in APPS.")
+    p_task.add_argument("app_name", help="Name of the app as defined in config.json.")
+
+    subparsers.add_parser(
+        "task-all",
+        help="Run task for every app defined in config.json.",
+    )
 
     return parser.parse_args()
 
@@ -399,6 +417,8 @@ def main():
         handle_launch(args.app_name)
     elif args.command == "task":
         handle_task(args.app_name)
+    elif args.command == "task-all":
+        handle_task_all()
     else:
         # Should never hit this with argparse's required=True
         print("[ERROR] Unknown command.", file=sys.stderr)
