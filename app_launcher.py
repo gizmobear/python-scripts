@@ -29,7 +29,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Iterable
 
 # ---------------------------------------------------------------------------
 # GLOBAL SETUP
@@ -70,6 +70,33 @@ def load_config() -> Dict[str, Any]:
         sys.exit(1)
 
     return data
+
+
+# ---------------------------------------------------------------------------
+# PATH NORMALIZATION
+# ---------------------------------------------------------------------------
+
+def _normalize_path(value: Union[str, Path]) -> Path:
+    """
+    Convert config path values to Path, expanding ~ and env vars.
+    We avoid strict resolve() so missing paths (to be deleted) don't error.
+    """
+    if isinstance(value, Path):
+        candidate = value
+    elif isinstance(value, str):
+        candidate = Path(os.path.expandvars(value)).expanduser()
+    else:
+        raise TypeError(f"Path value must be str or Path, got {type(value)}")
+
+    try:
+        return candidate.resolve(strict=False)
+    except RuntimeError:
+        # resolve can fail on deeply nested symlinks; fall back to raw
+        return candidate
+
+
+def _normalize_path_list(values: Iterable[Union[str, Path]]) -> List[Path]:
+    return [_normalize_path(v) for v in values]
 
 
 # ---------------------------------------------------------------------------
@@ -227,9 +254,9 @@ def secure_delete_path(path: Union[str, Path], passes: int = 3) -> None:
         logger.warning(f"Failed to remove directory {target}: {e}")
 
 
-def secure_delete_paths(paths: List[str], passes: int = 3) -> None:
+def secure_delete_paths(paths: Iterable[Union[str, Path]], passes: int = 3) -> None:
     for p in paths:
-        path_obj = Path(p)
+        path_obj = _normalize_path(p)
         logger.info(f"Securely deleting: {path_obj}")
         secure_delete_path(path_obj, passes=passes)
 
@@ -300,7 +327,13 @@ def handle_launch(app_name: str) -> None:
 def handle_task(app_name: str) -> None:
     app = get_app_config(app_name)
     max_days = app.get("max_days_idle")
-    cleanup_paths = app.get("cleanup_paths", [])
+    cleanup_paths_raw = app.get("cleanup_paths", [])
+
+    if cleanup_paths_raw and not isinstance(cleanup_paths_raw, (list, tuple)):
+        logger.error(f"'cleanup_paths' for '{app_name}' must be a list.")
+        sys.exit(1)
+
+    cleanup_paths = _normalize_path_list(cleanup_paths_raw)
 
     if max_days is None:
         logger.warning(f"No 'max_days_idle' configured for '{app_name}'. Nothing to do.")
