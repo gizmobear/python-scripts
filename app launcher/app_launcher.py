@@ -13,7 +13,7 @@ DESCRIPTION:
     - Launch applications and track usage timestamps
     - Automatic cleanup of idle application data
     - Secure deletion with multiple overwrite passes
-    - Cross-platform support (Windows, Linux, macOS)
+    - Windows-only application
     - Comprehensive logging and error handling
     - Database-backed state management with schema versioning
 
@@ -54,14 +54,13 @@ CONFIGURATION:
     }
 
     Paths support:
-    - Environment variables: %APPDATA%, $HOME, etc.
+    - Environment variables: %APPDATA%, %USERPROFILE%, etc.
     - Home directory expansion: ~/path/to/file
-    - Absolute and relative paths
+    - Absolute and relative paths (Windows format)
 
 LOGGING:
     All operations are logged to a file in the user's home directory:
-    - Windows: C:/Users/<username>/app_launcher.log
-    - Unix/Linux: /home/<username>/app_launcher.log
+    - Location: C:/Users/<username>/app_launcher.log
 
     Log files are automatically rotated when they reach 10MB, keeping 5 backup files.
     Logs include timestamps, log levels, and full error tracebacks.
@@ -71,8 +70,7 @@ LOGGING:
 
 DATABASE:
     Launch timestamps are stored in an SQLite database:
-    - Windows: %APPDATA%/.app_launch_tracker/state.db
-    - Unix/Linux: ~/.app_launch_tracker/state.db
+    - Location: %APPDATA%/.app_launch_tracker/state.db
 
     The database schema is versioned and automatically migrated when needed.
 
@@ -125,17 +123,12 @@ def setup_logging() -> None:
     Configure logging to both file and console.
     
     Log file is created in the user's home directory:
-    - Windows: C:\\Users\\<username>\\app_launcher.log
-    - Unix: /home/<username>/app_launcher.log
+    - Location: C:/Users/<username>/app_launcher.log
     
     Logs are rotated when they reach 10MB, keeping 5 backup files.
     """
-    # Get user home directory
-    if os.name == "nt":
-        home_dir = Path(os.environ.get("USERPROFILE", Path.home()))
-    else:
-        home_dir = Path.home()
-    
+    # Get user home directory (Windows)
+    home_dir = Path(os.environ.get("USERPROFILE", Path.home()))
     log_file = home_dir / "app_launcher.log"
     
     # Create formatter
@@ -286,13 +279,13 @@ def _normalize_path(value: Union[str, Path]) -> Path:
     Convert config path values to Path, expanding ~ and env vars.
     
     Handles:
-    - String paths with environment variables (e.g., $HOME, %APPDATA%)
+    - String paths with environment variables (e.g., %APPDATA%, %USERPROFILE%)
     - Home directory expansion (~)
-    - Relative and absolute paths
+    - Relative and absolute paths (Windows format)
     - Existing Path objects
     
     We avoid strict resolve() so missing paths (to be deleted) don't error.
-    On Windows, preserves drive letters and UNC paths.
+    Preserves drive letters and UNC paths.
     
     Args:
         value: String path or Path object to normalize
@@ -306,24 +299,21 @@ def _normalize_path(value: Union[str, Path]) -> Path:
     if isinstance(value, Path):
         candidate = value
     elif isinstance(value, str):
-        # Expand environment variables first (works on both Windows and Unix)
+        # Expand environment variables (Windows format: %VAR%)
         expanded = os.path.expandvars(value)
         # Then expand user home directory
         candidate = Path(expanded).expanduser()
     else:
         raise TypeError(f"Path value must be str or Path, got {type(value)}")
 
-    # On Windows, preserve absolute paths with drive letters
+    # Preserve absolute paths with drive letters
     # resolve(strict=False) will normalize but won't fail if path doesn't exist
     try:
         resolved = candidate.resolve(strict=False)
-        # On Windows, ensure we preserve the absolute path structure
-        # resolve() should handle this, but we verify
-        if os.name == "nt" and candidate.is_absolute():
-            # Ensure drive letter is preserved
-            if not resolved.is_absolute() and candidate.drive:
-                # Fallback: use original if resolve lost the drive
-                return candidate
+        # Ensure drive letter is preserved
+        if candidate.is_absolute() and not resolved.is_absolute() and candidate.drive:
+            # Fallback: use original if resolve lost the drive
+            return candidate
         return resolved
     except (RuntimeError, OSError):
         # resolve can fail on deeply nested symlinks or invalid paths
@@ -344,6 +334,78 @@ def _normalize_path_list(values: Iterable[Union[str, Path]]) -> List[Path]:
     return [_normalize_path(v) for v in values]
 
 
+def _is_safe_path(path: Path) -> bool:
+    """
+    Check if a path is safe to delete (not a critical system directory).
+    
+    Args:
+        path: Path to validate
+        
+    Returns:
+        True if path is safe, False if it's a protected system directory
+    """
+    # Get absolute path for comparison
+    try:
+        abs_path = path.resolve(strict=False)
+    except (RuntimeError, OSError):
+        abs_path = path
+    
+    # Convert to string for comparison (case-insensitive on Windows)
+    path_str = str(abs_path).upper()
+    
+    # Reject UNC paths (network paths) - too risky
+    if path_str.startswith("\\\\"):
+        return False
+    
+    # List of protected system directories (Windows)
+    protected_paths = [
+        r"C:\WINDOWS",
+        r"C:\WINDOWS\SYSTEM32",
+        r"C:\WINDOWS\SYSWOW64",
+        r"C:\PROGRAM FILES",
+        r"C:\PROGRAM FILES (X86)",
+        r"C:\PROGRAMDATA",
+        r"C:\$RECYCLE.BIN",
+        r"C:\SYSTEM VOLUME INFORMATION",
+        r"C:\BOOT",
+        r"C:\RECOVERY",
+    ]
+    
+    # Check if path starts with any protected directory
+    for protected in protected_paths:
+        if path_str.startswith(protected):
+            return False
+    
+    # Additional check: ensure path is within user directories
+    # Allow paths in user profile, appdata, temp, etc.
+    user_profile = os.environ.get("USERPROFILE", "").upper()
+    appdata_local = os.environ.get("LOCALAPPDATA", "").upper()
+    appdata_roaming = os.environ.get("APPDATA", "").upper()
+    temp = os.environ.get("TEMP", "").upper()
+    
+    safe_bases = [user_profile, appdata_local, appdata_roaming, temp]
+    # Remove empty strings
+    safe_bases = [b for b in safe_bases if b]
+    
+    # SECURITY: If we can't determine safe bases, be conservative and reject
+    if not safe_bases:
+        logger.warning(f"Cannot determine safe base directories. Rejecting path: {path}")
+        return False
+    
+    # Check if path is within one of the safe bases
+    is_safe = any(path_str.startswith(base) for base in safe_bases)
+    if not is_safe:
+        # Also allow paths on non-C: drives (external drives, etc.) but be cautious
+        if not path_str.startswith("C:\\"):
+            # Allow non-C: drives, but log for audit
+            logger.info(f"Allowing path on non-C: drive: {path}")
+            return True
+        # If it's on C: but not in a safe base, it's potentially dangerous
+        return False
+    
+    return True
+
+
 # ---------------------------------------------------------------------------
 # STATE STORAGE (SQLite3)
 # ---------------------------------------------------------------------------
@@ -355,18 +417,12 @@ def get_db_path() -> Path:
     """
     Return path to SQLite database.
     
-    Database is stored in:
-    - Windows: %APPDATA%/.app_launch_tracker/state.db
-    - Unix: ~/.app_launch_tracker/state.db
+    Database is stored in: %APPDATA%/.app_launch_tracker/state.db
     
     Returns:
         Path to the database file
     """
-    if os.name == "nt":
-        base = Path(os.environ.get("APPDATA", Path.home()))
-    else:
-        base = Path.home()
-    
+    base = Path(os.environ.get("APPDATA", Path.home()))
     state_dir = base / ".app_launch_tracker"
     state_dir.mkdir(parents=True, exist_ok=True)
     return state_dir / "state.db"
@@ -492,15 +548,23 @@ def get_last_launch(app_name: str) -> Optional[dt.datetime]:
 # ---------------------------------------------------------------------------
 
 def _make_writable(path: Path) -> None:
-    """Ensure file/dir is writable."""
+    """
+    Ensure file/dir is writable (Windows).
+    
+    On Windows, chmod has limited effect. This function attempts to make
+    the file writable, but Windows permissions are primarily ACL-based.
+    """
     try:
-        # 0o700: user rwx (not 0o777 for security)
         if path.exists():
+            # On Windows, chmod works but has limited effect
+            # We use it as a best-effort attempt
             if path.is_file():
                 path.chmod(0o600)  # User read/write only
             else:
-                path.chmod(0o700)  # User rwx only 
-    except (OSError, PermissionError):
+                path.chmod(0o700)  # User rwx only
+    except (OSError, PermissionError, AttributeError):
+        # chmod may not be fully supported on Windows, or path may not exist
+        # This is acceptable - we'll handle permission errors during deletion
         pass
 
 def secure_delete_file(path: Path, passes: int = 3) -> None:
@@ -585,7 +649,7 @@ def secure_delete_path(path: Union[str, Path], passes: int = 3) -> None:
 
 def secure_delete_paths(paths: Iterable[Union[str, Path]], passes: int = 3) -> None:
     """
-    Securely delete multiple paths.
+    Securely delete multiple paths with safety validation.
     
     Args:
         paths: Iterable of paths (strings or Path objects) to delete
@@ -593,8 +657,19 @@ def secure_delete_paths(paths: Iterable[Union[str, Path]], passes: int = 3) -> N
     """
     for p in paths:
         path_obj = _normalize_path(p)
+        
+        # Safety check: prevent deletion of critical system directories
+        if not _is_safe_path(path_obj):
+            logger.error(f"Refusing to delete protected system path: {path_obj}")
+            logger.error("This path appears to be a critical system directory.")
+            continue
+        
         logger.info(f"Securely deleting: {path_obj}")
-        secure_delete_path(path_obj, passes=passes)
+        try:
+            secure_delete_path(path_obj, passes=passes)
+        except Exception as e:
+            logger.error(f"Failed to delete {path_obj}: {e}")
+            # Continue with next path
 
 
 # ---------------------------------------------------------------------------
@@ -623,13 +698,18 @@ def get_app_config(app_name: str) -> Dict[str, Any]:
 
 
 def _normalize_cmd(cmd_value: Any) -> List[str]:
-    """Ensure cmd is a list of strings."""
+    """
+    Ensure cmd is a list of strings.
+    
+    Note: Command values are executed via subprocess.Popen. Since config.json
+    is a trusted local file, command injection risk is minimal. However, users
+    should only modify config.json with trusted applications.
+    """
     if isinstance(cmd_value, list) and all(isinstance(part, str) for part in cmd_value):
         return cmd_value
     if isinstance(cmd_value, str):
-        # posix=True usually handles quotes better, even on Windows for many cases,
-        # but standard practice for Windows shell is posix=False.
-        split_cmd = shlex.split(cmd_value, posix=(os.name != "nt"))
+        # Use posix=False for Windows shell command parsing
+        split_cmd = shlex.split(cmd_value, posix=False)
         if split_cmd:
             return split_cmd
     logger.error("'cmd' must be a non-empty list of strings or a string command line.")
@@ -670,12 +750,11 @@ def handle_launch(app_name: str) -> None:
 
     logger.info(f"Launching '{app_name}': {cmd}")
     try:
-        # Detach process
-        if os.name == "nt":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-            subprocess.Popen(cmd, creationflags=creationflags)
-        else:
-            subprocess.Popen(cmd, start_new_session=True)
+        # Detach process (Windows)
+        # SECURITY: Using list form of cmd prevents shell injection
+        # shell=False ensures no shell interpretation of arguments
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        subprocess.Popen(cmd, creationflags=creationflags, shell=False)
     except OSError as e:
         logger.error(f"Failed to launch '{app_name}': {e}")
         sys.exit(1)
@@ -696,12 +775,24 @@ def handle_task(app_name: str) -> None:
         app_name: Name of the app to check (must exist in config.json)
     """
     try:
-        app = get_app_config(app_name)
+        try:
+            app = get_app_config(app_name)
+        except SystemExit:
+            # get_app_config calls sys.exit() if app not found, but we want to continue
+            # with other apps when called from handle_task_all()
+            logger.error(f"App '{app_name}' not found in configuration. Skipping task.")
+            return
         
         # Check if executable exists (app may have been uninstalled)
         raw_cmd = app.get("cmd")
         if raw_cmd:
-            cmd = _normalize_cmd(raw_cmd)
+            try:
+                cmd = _normalize_cmd(raw_cmd)
+            except SystemExit:
+                # _normalize_cmd calls sys.exit() on invalid input, but we want to continue
+                # with other apps when called from handle_task_all()
+                logger.error(f"Invalid 'cmd' configuration for '{app_name}'. Skipping task.")
+                return
             exe = cmd[0]
             resolved_exe = shutil.which(exe) or (exe if Path(exe).exists() else None)
             
@@ -716,7 +807,8 @@ def handle_task(app_name: str) -> None:
 
         if cleanup_paths_raw and not isinstance(cleanup_paths_raw, (list, tuple)):
             logger.error(f"'cleanup_paths' for '{app_name}' must be a list.")
-            sys.exit(1)
+            logger.error(f"Skipping task for '{app_name}' due to configuration error.")
+            return
 
         cleanup_paths = _normalize_path_list(cleanup_paths_raw)
 
@@ -727,7 +819,8 @@ def handle_task(app_name: str) -> None:
         # Validate max_days_idle is a positive integer
         if not isinstance(max_days, int) or max_days <= 0:
             logger.error(f"'max_days_idle' for '{app_name}' must be a positive integer, got: {max_days}")
-            sys.exit(1)
+            logger.error(f"Skipping task for '{app_name}' due to configuration error.")
+            return
 
         last_launch = get_last_launch(app_name)
         now = dt.datetime.now(dt.timezone.utc)
@@ -812,13 +905,9 @@ def get_log_file_path() -> Path:
     Get the path to the log file.
     
     Returns:
-        Path to the log file in the user's home directory
+        Path to the log file in the user's home directory (Windows)
     """
-    if os.name == "nt":
-        home_dir = Path(os.environ.get("USERPROFILE", Path.home()))
-    else:
-        home_dir = Path.home()
-    
+    home_dir = Path(os.environ.get("USERPROFILE", Path.home()))
     return home_dir / "app_launcher.log"
 
 
