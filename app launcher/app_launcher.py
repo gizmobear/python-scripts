@@ -60,7 +60,7 @@ CONFIGURATION:
 
 LOGGING:
     All operations are logged to a file in the user's home directory:
-    - Windows: C:\\Users\\<username>\\app_launcher.log
+    - Windows: C:/Users/<username>/app_launcher.log
     - Unix/Linux: /home/<username>/app_launcher.log
 
     Log files are automatically rotated when they reach 10MB, keeping 5 backup files.
@@ -71,7 +71,7 @@ LOGGING:
 
 DATABASE:
     Launch timestamps are stored in an SQLite database:
-    - Windows: %APPDATA%\\.app_launch_tracker\\state.db
+    - Windows: %APPDATA%/.app_launch_tracker/state.db
     - Unix/Linux: ~/.app_launch_tracker/state.db
 
     The database schema is versioned and automatically migrated when needed.
@@ -125,7 +125,7 @@ def setup_logging() -> None:
     Configure logging to both file and console.
     
     Log file is created in the user's home directory:
-    - Windows: C:\Users\<username>\app_launcher.log
+    - Windows: C:\\Users\\<username>\\app_launcher.log
     - Unix: /home/<username>/app_launcher.log
     
     Logs are rotated when they reach 10MB, keeping 5 backup files.
