@@ -334,6 +334,36 @@ def _normalize_path_list(values: Iterable[Union[str, Path]]) -> List[Path]:
     return [_normalize_path(v) for v in values]
 
 
+def _path_starts_with(path_str: str, base: str) -> bool:
+    """
+    Check if a path starts with a base path, ensuring proper path boundary checking.
+    
+    This prevents false matches like:
+    - Base: "C:\\USERS\\AARON"
+    - Path: "C:\\USERS\\AARON-TEST\\DATA" (should NOT match)
+    
+    Args:
+        path_str: Path string to check (should be uppercase)
+        base: Base path string to check against (should be uppercase)
+        
+    Returns:
+        True if path is within base (exact match or subdirectory), False otherwise
+    """
+    # Normalize base to ensure it ends with a backslash for proper boundary checking
+    base_normalized = base.rstrip("\\") + "\\"
+    path_normalized = path_str.rstrip("\\") + "\\"
+    
+    # Check if path starts with base (with proper boundary)
+    if path_normalized.startswith(base_normalized):
+        return True
+    
+    # Also check exact match (without trailing separator)
+    if path_str == base.rstrip("\\"):
+        return True
+    
+    return False
+
+
 def _is_safe_path(path: Path) -> bool:
     """
     Check if a path is safe to delete (not a critical system directory).
@@ -371,9 +401,9 @@ def _is_safe_path(path: Path) -> bool:
         r"C:\RECOVERY",
     ]
     
-    # Check if path starts with any protected directory
+    # Check if path starts with any protected directory (with boundary checking)
     for protected in protected_paths:
-        if path_str.startswith(protected):
+        if _path_starts_with(path_str, protected.upper()):
             return False
     
     # Additional check: ensure path is within user directories
@@ -392,8 +422,8 @@ def _is_safe_path(path: Path) -> bool:
         logger.warning(f"Cannot determine safe base directories. Rejecting path: {path}")
         return False
     
-    # Check if path is within one of the safe bases
-    is_safe = any(path_str.startswith(base) for base in safe_bases)
+    # Check if path is within one of the safe bases (with boundary checking)
+    is_safe = any(_path_starts_with(path_str, base) for base in safe_bases)
     if not is_safe:
         # Also allow paths on non-C: drives (external drives, etc.) but be cautious
         if not path_str.startswith("C:\\"):
